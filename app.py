@@ -3,7 +3,7 @@ import json
 import time
 import pandas as pd
 import streamlit as st
-from extract import extract_video_id, extract_products
+from extract import extract_video_id, extract_products, get_server_ip
 
 st.set_page_config(
     page_title="YouTube Shopping Product Extractor",
@@ -146,13 +146,17 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Detect host environment IP
+if "server_ip" not in st.session_state:
+    st.session_state["server_ip"] = get_server_ip()
+
 # ----------------- Sidebar -----------------
 with st.sidebar:
     st.title("🛍️ YT Shopping")
+    st.caption(f"Server IP: `{st.session_state['server_ip']}`")
     st.markdown(
         """
         Extract affiliate product tags (Amazon, Flipkart, Shopsy) from any YouTube Short or Video.
-        Uses YouTube's official **InnerTube API** with cloud compatibility (bypasses datacenter blocks).
         """
     )
     st.divider()
@@ -162,7 +166,6 @@ with st.sidebar:
         "India (IN) - Amazon IN / Flipkart / Shopsy": "IN",
         "United States (US) - Amazon US / Shopify": "US",
         "United Kingdom (GB)": "GB",
-        "Global / Auto": "IN",
     }
     selected_region_label = st.selectbox(
         "Target Region / Market (gl):",
@@ -175,23 +178,39 @@ with st.sidebar:
     request_timeout = st.slider("Request Timeout (seconds)", min_value=5, max_value=30, value=15, step=1)
 
     st.divider()
-    st.markdown("### 📌 Why Cloud Scrapers Fail")
+    st.subheader("🛡️ Cloud Bypass (Optional)")
     st.markdown(
         """
-        Standard HTML scrapers fail on cloud hosts (like Streamlit Cloud / AWS) because YouTube blocks datacenter IPs with consent screens.
-        
-        This app uses **YouTube's InnerTube API**, which runs anywhere in the world and returns region-targeted shopping metadata!
-        """
+        <small style="color: #aaa;">If running on Streamlit Cloud and YouTube blocks requests with 403 / 0 products, you can pass your browser cookies or a proxy:</small>
+        """,
+        unsafe_allow_html=True
+    )
+    user_cookie = st.text_input(
+        "YouTube Cookie:",
+        placeholder="VISITOR_INFO1_LIVE=...; PREF=...",
+        type="password",
+        help="Paste Cookie header from youtube.com if cloud server IP is challenged by YouTube.",
+    )
+    user_proxy = st.text_input(
+        "HTTP/HTTPS Proxy (optional):",
+        placeholder="http://username:password@host:port",
+        help="Optional residential or datacenter proxy.",
     )
 
     st.divider()
-    st.caption("Powered by Streamlit & Python • InnerTube API")
+    st.markdown("### 💡 Running Locally vs Cloud")
+    st.markdown(
+        """
+        - **Local**: Run `py -m streamlit run app.py` on your PC. Uses your home/residential IP where YouTube never blocks!
+        - **Streamlit Cloud**: Runs on AWS datacenters, which YouTube occasionally challenges with bot detection.
+        """
+    )
 
 # ----------------- App Header -----------------
 st.title("🛍️ YouTube Shopping Product Extractor")
 st.markdown("Inspect and export tagged affiliate products (Amazon, Flipkart, Shopsy) from YouTube videos and Shorts.")
 
-tabs = st.tabs(["⚡ Single Video Scanner", "📦 Batch URL Scanner", "🚀 Deploy to Streamlit Cloud"])
+tabs = st.tabs(["⚡ Single Video Scanner", "📦 Batch URL Scanner", "🛠️ Cloud Diagnostics & Guide"])
 
 # =========================================================================
 # TAB 1: Single Video Scanner
@@ -221,10 +240,16 @@ with tabs[0]:
         if not url_input.strip():
             st.warning("⚠️ Please provide a valid YouTube URL.")
         else:
-            with st.spinner("Extracting shopping tags via cloud-safe InnerTube API..."):
+            with st.spinner("Extracting shopping tags (trying MWEB, InnerTube & Web)..."):
                 try:
                     video_id = extract_video_id(url_input)
-                    data = extract_products(video_id, gl=gl_code, timeout=request_timeout)
+                    data = extract_products(
+                        video_id,
+                        gl=gl_code,
+                        cookie=user_cookie,
+                        proxy=user_proxy,
+                        timeout=request_timeout
+                    )
                     st.session_state["single_result"] = {
                         "video_id": video_id,
                         "url": url_input.strip(),
@@ -238,6 +263,7 @@ with tabs[0]:
         vid = res["video_id"]
         data = res["data"]
         products = data.get("products", [])
+        diagnostics = data.get("diagnostics", [])
 
         st.divider()
 
@@ -260,17 +286,40 @@ with tabs[0]:
             st.markdown(
                 f"""
                 - **Video ID**: `{vid}`
-                - **Source**: `{data.get('source', 'InnerTube API')}`
+                - **Extraction Method**: `{data.get('source', 'None')}`
                 - **Shopping Renderer Tags**: `{data.get('product_renderer_count', 0)}`
                 - **Unique ASINs (Amazon)**: `{len(data.get('amazon_asins', []))}`
                 - **Unique PIDs (Flipkart/Shopsy)**: `{len(data.get('flipkart_pids', []))}`
                 """
             )
 
+        # Connection Diagnostics Expander
+        with st.expander("🛠️ Connection Diagnostics & Raw Attempt Details", expanded=(data["total_unique"] == 0)):
+            st.write(f"**Current Outbound Server IP**: `{st.session_state.get('server_ip', 'Unknown')}`")
+            if diagnostics:
+                diag_df = pd.DataFrame(diagnostics)
+                st.dataframe(diag_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No diagnostic trace available.")
+
         st.divider()
 
         if not products:
-            st.info("ℹ️ No shopping tags or affiliate products were detected in this video.")
+            st.warning(
+                """
+                ⚠️ **0 Products Detected by Cloud Server.**
+                
+                YouTube frequently restricts requests originating from cloud hosting IP ranges (AWS / Streamlit Community Cloud).
+                
+                **To resolve this immediately:**
+                1. **Run Locally (Guaranteed)**: Run the app directly on your laptop/PC with:
+                   ```bash
+                   py -m streamlit run app.py
+                   ```
+                   *(Your local residential IP is never blocked by YouTube!)*
+                2. **Or Add Cookies**: In the sidebar under **🛡️ Cloud Bypass**, paste your browser's YouTube cookies.
+                """
+            )
         else:
             # Controls: Search, Platform filter & View Switch
             col_search, col_filter, col_view = st.columns([2, 1.5, 1.5])
@@ -282,7 +331,6 @@ with tabs[0]:
             with col_view:
                 view_mode = st.radio("Display View", ["Card Gallery", "Data Table"], horizontal=True)
 
-            # Filter data
             filtered_products = products
             if selected_platform != "All":
                 filtered_products = [p for p in filtered_products if p.get("platform") == selected_platform]
@@ -411,7 +459,7 @@ with tabs[1]:
     if batch_text.strip():
         urls_to_process.extend([line.strip() for line in batch_text.splitlines() if line.strip()])
 
-    urls_to_process = list(dict.fromkeys(urls_to_process))  # deduplicate
+    urls_to_process = list(dict.fromkeys(urls_to_process))
 
     if urls_to_process:
         st.info(f"Detected **{len(urls_to_process)}** unique URLs ready for extraction.")
@@ -432,12 +480,18 @@ with tabs[1]:
 
             try:
                 vid = extract_video_id(url)
-                res = extract_products(vid, gl=gl_code, timeout=request_timeout)
+                res = extract_products(
+                    vid,
+                    gl=gl_code,
+                    cookie=user_cookie,
+                    proxy=user_proxy,
+                    timeout=request_timeout
+                )
 
                 summary_rows.append({
                     "Video URL": url,
                     "Video ID": vid,
-                    "Status": "Success",
+                    "Status": "Success" if res["total_unique"] > 0 else "0 Products Found",
                     "Total Products": res["total_unique"],
                     "Amazon Count": res["amazon_count"],
                     "Flipkart Count": res["flipkart_count"],
@@ -500,31 +554,27 @@ with tabs[1]:
 
 
 # =========================================================================
-# TAB 3: Deploy to Streamlit Cloud
+# TAB 3: Diagnostics & Cloud Guide
 # =========================================================================
 with tabs[2]:
-    st.subheader("🚀 Deploying to Streamlit Community Cloud")
+    st.subheader("🛠️ Cloud Datacenter Blocking vs Local Execution")
     st.markdown(
         """
-        You can host this application online for free using **Streamlit Community Cloud** with your GitHub account.
-        Here is the quick 3-step deployment process:
-        """
-    )
+        ### Why do cloud scrapers get blocked by YouTube?
+        1. **Datacenter IP Range Restrictions**:
+           Google / YouTube aggressively blocks or challenges HTTP traffic coming from major cloud hosting providers (AWS, Azure, DigitalOcean, Google Cloud).
+           Since **Streamlit Community Cloud is hosted on AWS US-East**, YouTube flags direct requests without authentic browser cookies.
+        
+        2. **How to Run with 100% Reliability:**
+           The most reliable way is running Streamlit **locally on your computer**:
+           ```bash
+           py -m streamlit run app.py
+           ```
+           Because your computer uses a residential IP address, YouTube will never challenge or block it!
 
-    st.markdown(
-        """
-        #### Step 1: Commit & Push to GitHub
-        ```bash
-        git add .
-        git commit -m "fix: use InnerTube API for reliable cloud extraction"
-        git push origin main
-        ```
-
-        #### Step 2: Deploy on Streamlit Cloud
-        1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-        2. Click **New app**.
-        3. Select your repository: `Animusxop/youtube-shopping-extractor`.
-        4. Set Main file path: `app.py`.
-        5. Click **Deploy!** 🚀
+        3. **How to bypass on Streamlit Cloud:**
+           - Export your YouTube session cookies using a browser extension like *Cookie-Editor* or *EditThisCookie*.
+           - Copy the cookie string and paste it into the **YouTube Cookie** field in the sidebar.
+           - Or configure a residential proxy in the proxy field.
         """
     )
