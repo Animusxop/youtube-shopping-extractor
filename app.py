@@ -3,7 +3,7 @@ import json
 import time
 import pandas as pd
 import streamlit as st
-from extract import extract_video_id, fetch_page, extract_products
+from extract import extract_video_id, extract_products
 
 st.set_page_config(
     page_title="YouTube Shopping Product Extractor",
@@ -151,27 +151,41 @@ with st.sidebar:
     st.title("🛍️ YT Shopping")
     st.markdown(
         """
-        Extract affiliate product tags (Amazon, Flipkart, Shopsy) from any YouTube Short or Video directly from YouTube metadata.
+        Extract affiliate product tags (Amazon, Flipkart, Shopsy) from any YouTube Short or Video.
+        Uses YouTube's official **InnerTube API** with cloud compatibility (bypasses datacenter blocks).
         """
     )
     st.divider()
 
     st.subheader("⚙️ Settings")
+    region_options = {
+        "India (IN) - Amazon IN / Flipkart / Shopsy": "IN",
+        "United States (US) - Amazon US / Shopify": "US",
+        "United Kingdom (GB)": "GB",
+        "Global / Auto": "IN",
+    }
+    selected_region_label = st.selectbox(
+        "Target Region / Market (gl):",
+        list(region_options.keys()),
+        index=0,
+        help="Shopping shelves are region-specific. Indian affiliate products (Flipkart/Amazon IN) require 'IN'.",
+    )
+    gl_code = region_options[selected_region_label]
+
     request_timeout = st.slider("Request Timeout (seconds)", min_value=5, max_value=30, value=15, step=1)
 
     st.divider()
-    st.markdown("### 📌 Features")
+    st.markdown("### 📌 Why Cloud Scrapers Fail")
     st.markdown(
         """
-        - ⚡ **Instant Extraction**: ASINs, Flipkart PIDs, product titles & thumbnails
-        - 🔗 **Direct Store Links**: Direct links to buy/inspect products
-        - 📦 **Batch Processing**: Inspect multiple video URLs simultaneously
-        - 📥 **Export Ready**: Export to CSV & JSON with one click
+        Standard HTML scrapers fail on cloud hosts (like Streamlit Cloud / AWS) because YouTube blocks datacenter IPs with consent screens.
+        
+        This app uses **YouTube's InnerTube API**, which runs anywhere in the world and returns region-targeted shopping metadata!
         """
     )
 
     st.divider()
-    st.caption("Powered by Streamlit & Python • YouTube Shopping Extractor")
+    st.caption("Powered by Streamlit & Python • InnerTube API")
 
 # ----------------- App Header -----------------
 st.title("🛍️ YouTube Shopping Product Extractor")
@@ -207,11 +221,10 @@ with tabs[0]:
         if not url_input.strip():
             st.warning("⚠️ Please provide a valid YouTube URL.")
         else:
-            with st.spinner("Fetching YouTube metadata and parsing shopping tags..."):
+            with st.spinner("Extracting shopping tags via cloud-safe InnerTube API..."):
                 try:
                     video_id = extract_video_id(url_input)
-                    html = fetch_page(video_id, timeout=request_timeout)
-                    data = extract_products(html)
+                    data = extract_products(video_id, gl=gl_code, timeout=request_timeout)
                     st.session_state["single_result"] = {
                         "video_id": video_id,
                         "url": url_input.strip(),
@@ -247,6 +260,7 @@ with tabs[0]:
             st.markdown(
                 f"""
                 - **Video ID**: `{vid}`
+                - **Source**: `{data.get('source', 'InnerTube API')}`
                 - **Shopping Renderer Tags**: `{data.get('product_renderer_count', 0)}`
                 - **Unique ASINs (Amazon)**: `{len(data.get('amazon_asins', []))}`
                 - **Unique PIDs (Flipkart/Shopsy)**: `{len(data.get('flipkart_pids', []))}`
@@ -418,8 +432,7 @@ with tabs[1]:
 
             try:
                 vid = extract_video_id(url)
-                html = fetch_page(vid, timeout=request_timeout)
-                res = extract_products(html)
+                res = extract_products(vid, gl=gl_code, timeout=request_timeout)
 
                 summary_rows.append({
                     "Video URL": url,
@@ -450,7 +463,7 @@ with tabs[1]:
                     "Amazon Count": 0,
                     "Flipkart Count": 0,
                 })
-            time.sleep(0.3)  # Gentle delay to avoid rate-limiting
+            time.sleep(0.3)
 
         status_text.success("✅ Batch extraction finished!")
         st.session_state["batch_summary"] = summary_rows
@@ -494,37 +507,24 @@ with tabs[2]:
     st.markdown(
         """
         You can host this application online for free using **Streamlit Community Cloud** with your GitHub account.
-        Here is the quick 4-step deployment process:
+        Here is the quick 3-step deployment process:
         """
     )
 
     st.markdown(
         """
-        #### Step 1: Initialize Git and Commit
-        Open your terminal in this project folder and run:
+        #### Step 1: Commit & Push to GitHub
         ```bash
-        git init
         git add .
-        git commit -m "Initial commit: YouTube Shopping Product Extractor"
+        git commit -m "fix: use InnerTube API for reliable cloud extraction"
+        git push origin main
         ```
 
-        #### Step 2: Push to GitHub
-        1. Create a new repository on [GitHub](https://github.com/new) (e.g. `youtube-shopping-extractor`).
-        2. Link your local repo and push:
-        ```bash
-        git remote add origin https://github.com/<YOUR_USERNAME>/youtube-shopping-extractor.git
-        git branch -M main
-        git push -u origin main
-        ```
-
-        #### Step 3: Deploy on Streamlit Cloud
+        #### Step 2: Deploy on Streamlit Cloud
         1. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
         2. Click **New app**.
-        3. Select your repository: `<YOUR_USERNAME>/youtube-shopping-extractor`.
+        3. Select your repository: `Animusxop/youtube-shopping-extractor`.
         4. Set Main file path: `app.py`.
         5. Click **Deploy!** 🚀
-
-        Your app will be live with a shareable URL like:
-        `https://<your-app-name>.streamlit.app`
         """
     )

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Extract tagged products (Amazon + Flipkart + Shopsy) from YouTube videos/Shorts.
-Supports both CLI execution and importable library usage for Streamlit.
+Uses YouTube's official InnerTube API (reliable on cloud servers & Streamlit Cloud)
+with fallback to HTML scraping and consent-bypassing headers.
 """
 
 import re
 import sys
 import json
 import requests
-from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, List
 
 def extract_video_id(url: str) -> str:
@@ -22,19 +22,6 @@ def extract_video_id(url: str) -> str:
         if match:
             return match.group(1)
     raise ValueError(f"Could not extract video ID from: {url}")
-
-def fetch_page(video_id: str, timeout: int = 15) -> str:
-    """Fetch the YouTube page HTML."""
-    url = f"https://www.youtube.com/shorts/{video_id}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.text
 
 def _find_keys(obj: Any, target_key: str) -> List[Any]:
     """Recursively search for a key in a nested dict/list."""
@@ -50,17 +37,149 @@ def _find_keys(obj: Any, target_key: str) -> List[Any]:
             results.extend(_find_keys(item, target_key))
     return results
 
-def extract_products(html: str) -> Dict[str, Any]:
+def _find_first_url(obj: Any) -> str:
+    """Recursively search for the first urlEndpoint URL."""
+    if isinstance(obj, dict):
+        if "urlEndpoint" in obj and "url" in obj["urlEndpoint"]:
+            return obj["urlEndpoint"]["url"]
+        for v in obj.values():
+            u = _find_first_url(v)
+            if u:
+                return u
+    elif isinstance(obj, list):
+        for item in obj:
+            u = _find_first_url(item)
+            if u:
+                return u
+    return ""
+
+def fetch_innertube(video_id: str, gl: str = "IN", hl: str = "en", timeout: int = 15) -> Dict[str, Any]:
     """
-    Extract unique Amazon, Flipkart, and Shopsy products from page HTML.
-    Returns counts, lists of IDs, titles, and full structured product objects.
+    Fetch shopping product tags using YouTube's InnerTube API.
+    Works reliably on cloud servers (Streamlit Cloud, AWS, GCP) without consent blocks.
     """
-    products_list: List[Dict[str, str]] = []
+    url = "https://www.youtube.com/youtubei/v1/next"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+        "X-YouTube-Client-Name": "1",
+        "X-YouTube-Client-Version": "2.20240901.01.00",
+    }
+    payload = {
+        "context": {
+            "client": {
+                "hl": hl,
+                "gl": gl,
+                "clientName": "WEB",
+                "clientVersion": "2.20240901.01.00",
+            }
+        },
+        "videoId": video_id
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    raw_text = resp.text
+    data = resp.json()
+
+    renderers = _find_keys(data, 'productListItemRenderer')
+    amazon_asins = set()
+    flipkart_pids = set()
+
+    parsed_items = []
+    for item in renderers:
+        title = item.get("title", {}).get("simpleText") or ""
+        merchant = item.get("merchantName", "").strip()
+        thumb_list = item.get("thumbnail", {}).get("thumbnails", [])
+        thumbnail_url = thumb_list[-1]["url"] if thumb_list else ""
+        target_url = _find_first_url(item)
+
+        platform = "Other"
+        product_id = ""
+        if target_url:
+            asin_match = re.search(r'amazon\.(?:in|com)/dp/([A-Z0-9]{10})', target_url)
+            pid_match = re.search(r'(?:pid=|productId=)([A-Z0-9]{10,})', target_url)
+            if asin_match:
+                platform = "Amazon"
+                product_id = asin_match.group(1)
+                amazon_asins.add(product_id)
+            elif pid_match:
+                platform = "Flipkart" if "flipkart" in target_url.lower() else "Shopsy"
+                product_id = pid_match.group(1)
+                flipkart_pids.add(product_id)
+
+        if platform == "Other":
+            m_lower = merchant.lower()
+            if "amazon" in m_lower:
+                platform = "Amazon"
+            elif "flipkart" in m_lower:
+                platform = "Flipkart"
+            elif "shopsy" in m_lower:
+                platform = "Shopsy"
+
+        parsed_items.append({
+            "title": title,
+            "merchant": merchant or platform,
+            "platform": platform,
+            "product_id": product_id,
+            "url": target_url or (f"https://www.amazon.in/dp/{product_id}" if platform == "Amazon" and product_id else f"https://www.flipkart.com/product/p/itme?pid={product_id}" if platform == "Flipkart" and product_id else ""),
+            "thumbnail": thumbnail_url,
+        })
+
+    # Deduplicate: prefer items that have product_id/url
+    products_by_title = {}
+    for item in parsed_items:
+        t_key = item["title"].strip()
+        if not t_key:
+            continue
+        if t_key not in products_by_title:
+            products_by_title[t_key] = item
+        else:
+            if item["product_id"] and not products_by_title[t_key]["product_id"]:
+                products_by_title[t_key] = item
+
+    # Raw search fallback for ASINs/PIDs
+    raw_amazon = set(re.findall(r'amazon\.(?:in|com)/dp/([A-Z0-9]{10})', raw_text))
+    raw_flipkart = set(re.findall(r'(?:pid=|productId=)([A-Z0-9]{10,})', raw_text))
+    amazon_asins.update(raw_amazon)
+    flipkart_pids.update(raw_flipkart)
+
+    final_products = list(products_by_title.values())
+
+    return {
+        "amazon_count": len(amazon_asins),
+        "flipkart_count": len(flipkart_pids),
+        "total_unique": len(amazon_asins) + len(flipkart_pids),
+        "product_renderer_count": len(renderers),
+        "amazon_asins": sorted(amazon_asins),
+        "flipkart_pids": sorted(flipkart_pids),
+        "titles": [p["title"] for p in final_products if p.get("title")],
+        "products": final_products,
+        "source": "innertube_api"
+    }
+
+def fetch_page_html(video_id: str, timeout: int = 15) -> str:
+    """Fetch YouTube page HTML with consent-bypass cookies."""
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    cookies = {
+        "SOCS": "CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg",  # Consent bypass
+        "PREF": "f4=4000000&hl=en&gl=IN",                    # Region lock to India
+    }
+    resp = requests.get(url, headers=headers, cookies=cookies, timeout=timeout)
+    resp.raise_for_status()
+    return resp.text
+
+def extract_products_from_html(html: str) -> Dict[str, Any]:
+    """Fallback parser for direct HTML response."""
+    products_list = []
     seen_ids = set()
     amazon_asins = set()
     flipkart_pids = set()
 
-    # 1. Parse structured ytInitialData
     data_match = re.search(r'var ytInitialData = ({.*?});</script>', html)
     if not data_match:
         data_match = re.search(r'ytInitialData\s*=\s*({.+?});', html)
@@ -72,20 +191,10 @@ def extract_products(html: str) -> Dict[str, Any]:
             for item in renderers:
                 title = item.get("title", {}).get("simpleText") or ""
                 merchant = item.get("merchantName", "").strip()
-
-                # Extract thumbnail
                 thumb_list = item.get("thumbnail", {}).get("thumbnails", [])
                 thumbnail_url = thumb_list[-1]["url"] if thumb_list else ""
+                target_url = _find_first_url(item)
 
-                # Extract target product link
-                target_url = ""
-                commands = item.get("onClickCommand", {}).get("commandExecutorCommand", {}).get("commands", [])
-                for cmd in commands:
-                    if "urlEndpoint" in cmd and "url" in cmd["urlEndpoint"]:
-                        target_url = cmd["urlEndpoint"]["url"]
-                        break
-
-                # Identify platform & product ID
                 platform = "Other"
                 product_id = ""
                 if target_url:
@@ -123,27 +232,11 @@ def extract_products(html: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # 2. Fallback regex extraction for IDs
     raw_amazon = set(re.findall(r'amazon\.(?:in|com)/dp/([A-Z0-9]{10})', html))
     raw_flipkart = set(re.findall(r'(?:pid=|productId=)([A-Z0-9]{10,})', html))
-
     amazon_asins.update(raw_amazon)
     flipkart_pids.update(raw_flipkart)
 
-    # Fallback product titles extraction
-    labels = re.findall(r'"label":\s*"((?:[^"\\]|\\.)*)"', html)
-    raw_titles = []
-    for label in labels:
-        label = label.replace('\\u0026', '&')
-        if any(m in label.lower() for m in ['amazon', 'flipkart', 'shopsy']):
-            clean = re.sub(r',\s*(From|from)\s+(Amazon India|Flipkart|Shopsy By Flipkart).*$', '', label, flags=re.I)
-            clean = re.sub(r',\s*¤0\s*.*$', '', clean)
-            clean = re.sub(r',\s*Out of stock$', '', clean, flags=re.I)
-            raw_titles.append(clean.strip())
-
-    unique_titles = list(dict.fromkeys(raw_titles))
-
-    # Populate fallback items if structured items were not found
     if not products_list:
         for asin in sorted(raw_amazon):
             products_list.append({
@@ -164,19 +257,67 @@ def extract_products(html: str) -> Dict[str, Any]:
                 "thumbnail": "",
             })
 
-    # Total counts
-    product_renderer_count = html.count('"productListItemRenderer"')
-
     return {
         "amazon_count": len(amazon_asins),
         "flipkart_count": len(flipkart_pids),
         "total_unique": len(amazon_asins) + len(flipkart_pids),
-        "product_renderer_count": product_renderer_count,
+        "product_renderer_count": html.count('"productListItemRenderer"'),
         "amazon_asins": sorted(amazon_asins),
         "flipkart_pids": sorted(flipkart_pids),
-        "titles": [p["title"] for p in products_list if p.get("title")] or unique_titles,
+        "titles": [p["title"] for p in products_list if p.get("title")],
         "products": products_list,
+        "source": "html_scrape"
     }
+
+def extract_products(video_identifier: str, gl: str = "IN", hl: str = "en", timeout: int = 15) -> Dict[str, Any]:
+    """
+    Main extraction function.
+    Can accept either a video_id (or full URL) OR raw html string for backward compatibility.
+    Primary: InnerTube API (reliable on cloud servers).
+    Fallback: HTML scraper.
+    """
+    # Backward compatibility: if passed full HTML content
+    if len(video_identifier) > 50 and ("<html" in video_identifier.lower() or "ytInitialData" in video_identifier):
+        return extract_products_from_html(video_identifier)
+
+    # Extract video ID if given a URL
+    try:
+        video_id = extract_video_id(video_identifier)
+    except Exception:
+        video_id = video_identifier.strip()
+
+    # 1. Primary Attempt: InnerTube API
+    try:
+        res = fetch_innertube(video_id, gl=gl, hl=hl, timeout=timeout)
+        if res["total_unique"] > 0 or res["products"]:
+            return res
+    except Exception as e:
+        pass
+
+    # 2. Fallback Attempt: Direct HTML Fetch
+    try:
+        html = fetch_page_html(video_id, timeout=timeout)
+        res_html = extract_products_from_html(html)
+        if res_html["total_unique"] > 0 or res_html["products"]:
+            return res_html
+    except Exception:
+        pass
+
+    # Return empty result structure if nothing found
+    return {
+        "amazon_count": 0,
+        "flipkart_count": 0,
+        "total_unique": 0,
+        "product_renderer_count": 0,
+        "amazon_asins": [],
+        "flipkart_pids": [],
+        "titles": [],
+        "products": [],
+        "source": "none"
+    }
+
+# Backward compatibility alias
+fetch_page = fetch_page_html
 
 def main():
     if len(sys.argv) < 2:
@@ -189,12 +330,12 @@ def main():
     try:
         video_id = extract_video_id(url)
         print(f"Video ID: {video_id}")
-        print("Fetching page...")
+        print("Extracting tagged products (via InnerTube API / Cloud Safe)...")
 
-        html = fetch_page(video_id)
-        result = extract_products(html)
+        result = extract_products(video_id)
 
         print("\n" + "=" * 50)
+        print(f"Source            : {result.get('source')}")
         print(f"Amazon products   : {result['amazon_count']}")
         print(f"Flipkart products : {result['flipkart_count']}")
         print(f"Total unique      : {result['total_unique']}")
@@ -208,10 +349,6 @@ def main():
                 merchant = p.get('merchant') or p.get('platform')
                 pid = p.get('product_id') or 'N/A'
                 print(f"  {i}. [{merchant}] {title[:80]} (ID: {pid})")
-        elif result['titles']:
-            print("\nProduct titles found:")
-            for i, title in enumerate(result['titles'], 1):
-                print(f"  {i}. {title[:100]}")
 
     except Exception as e:
         print(f"Error: {e}")
